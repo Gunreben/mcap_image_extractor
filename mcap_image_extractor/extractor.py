@@ -473,6 +473,9 @@ class McapImageExtractor:
         all_gps: List[Dict] = []
         all_odom: List[Dict] = []
 
+        # Frame counters persist across bags to avoid filename collisions
+        frame_counters: Dict[str, int] = {}
+
         total_bags = len(self.config.bag_paths)
         for bag_idx, bag_path in enumerate(self.config.bag_paths):
             if self._cancelled:
@@ -482,6 +485,7 @@ class McapImageExtractor:
                     bag_path, bag_idx, total_bags,
                     images_dir, output_dir,
                     all_metadata, all_gps, all_odom,
+                    frame_counters,
                 )
                 self.stats.bags_processed += 1
             except Exception as e:
@@ -507,6 +511,7 @@ class McapImageExtractor:
         all_metadata: List[Dict],
         all_gps: List[Dict],
         all_odom: List[Dict],
+        frame_counters: Dict[str, int],
     ):
         bag_name = Path(bag_path).stem
         self._progress(bag_idx / total_bags,
@@ -528,9 +533,8 @@ class McapImageExtractor:
         if self.config.extract_pointclouds:
             topics_to_read.update(self.config.pointcloud_topics)
 
-        # Per-topic state
+        # Frame interval resets per bag (each bag is an independent recording)
         last_extract_time: Dict[str, float] = {}
-        frame_counters: Dict[str, int] = {}
 
         msg_count = 0
         with open(bag_path, 'rb') as f:
