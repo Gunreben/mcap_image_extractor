@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>mcap_image_extractor</name>
+  <version>1.0.0</version>
+  <description>Extract images from ROS2 MCAP bags for CVAT labeling</description>
+  <maintainer email="user@example.com">User</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
