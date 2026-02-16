@@ -5,6 +5,8 @@ Provides a modern interface for:
 - Adding / removing multiple MCAP bag files
 - Discovering and selecting topics (images, GPS, IMU, pointclouds, odom)
 - Configuring output format, frame interval, and metadata options
+- Optional image rectification with auto-mapped camera intrinsics
+- Persistent user preferences (default output dir, calibration path)
 - Running extraction with live progress and log output
 """
 
@@ -18,20 +20,31 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QListWidget, QListWidgetItem, QLineEdit,
     QFileDialog, QDoubleSpinBox, QSpinBox, QComboBox, QCheckBox,
     QGroupBox, QProgressBar, QTextEdit, QMessageBox, QSplitter,
-    QAbstractItemView,
+    QAbstractItemView, QDialog, QDialogButtonBox, QTableWidget,
+    QTableWidgetItem, QHeaderView,
 )
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QSettings
 from PySide6.QtGui import QFont, QColor
 
 import qt_material
 
 from .extractor import (
-    ExtractionConfig, ExtractionStats, McapImageExtractor,
-    TopicInfo, inspect_bag,
+    BagSummary, CameraIntrinsics, ExtractionConfig, ExtractionStats,
+    McapImageExtractor, TopicInfo, inspect_bag,
+    scan_calibration_dir, auto_map_topics_to_calibrations,
 )
 
 logger = logging.getLogger(__name__)
 
+# Settings keys
+SETTINGS_ORG = 'McapExtractor'
+SETTINGS_APP = 'McapImageExtractor'
+PREF_CALIBRATION_DIR = 'preferences/calibration_dir'
+PREF_OUTPUT_DIR = 'preferences/output_dir'
+
+DEFAULT_CALIBRATION_DIR = (
+    '/home/gunreben/ros2_ws/src/tractor_multi_cam_publisher/calibration'
+)
 
 # ---------------------------------------------------------------------------
 # Category colours and labels for the topic list
@@ -57,12 +70,79 @@ CATEGORY_LABELS = {
 
 
 # ---------------------------------------------------------------------------
+# Preferences dialog
+# ---------------------------------------------------------------------------
+
+class PreferencesDialog(QDialog):
+    """Modal dialog for persistent application preferences."""
+
+    def __init__(self, settings: QSettings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Preferences')
+        self.setMinimumWidth(550)
+        self.settings = settings
+
+        lay = QVBoxLayout(self)
+
+        # --- Default calibration directory ---
+        calib_group = QGroupBox("Default Calibration Directory")
+        calib_lay = QHBoxLayout(calib_group)
+        self.calib_edit = QLineEdit()
+        self.calib_edit.setText(
+            settings.value(PREF_CALIBRATION_DIR, DEFAULT_CALIBRATION_DIR))
+        self.calib_edit.setPlaceholderText("Path to *.intrinsics.yaml files")
+        calib_lay.addWidget(self.calib_edit, stretch=1)
+        calib_browse = QPushButton("Browse")
+        calib_browse.clicked.connect(self._browse_calib)
+        calib_lay.addWidget(calib_browse)
+        lay.addWidget(calib_group)
+
+        # --- Default output directory ---
+        out_group = QGroupBox("Default Output Directory")
+        out_lay = QHBoxLayout(out_group)
+        self.output_edit = QLineEdit()
+        self.output_edit.setText(
+            settings.value(PREF_OUTPUT_DIR, ''))
+        self.output_edit.setPlaceholderText(
+            "Leave empty to auto-set from bag location")
+        out_lay.addWidget(self.output_edit, stretch=1)
+        out_browse = QPushButton("Browse")
+        out_browse.clicked.connect(self._browse_output)
+        out_lay.addWidget(out_browse)
+        lay.addWidget(out_group)
+
+        # --- Buttons ---
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._save_and_accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def _browse_calib(self):
+        d = QFileDialog.getExistingDirectory(
+            self, "Select Calibration Directory", self.calib_edit.text())
+        if d:
+            self.calib_edit.setText(d)
+
+    def _browse_output(self):
+        d = QFileDialog.getExistingDirectory(
+            self, "Select Default Output Directory", self.output_edit.text())
+        if d:
+            self.output_edit.setText(d)
+
+    def _save_and_accept(self):
+        self.settings.setValue(PREF_CALIBRATION_DIR, self.calib_edit.text())
+        self.settings.setValue(PREF_OUTPUT_DIR, self.output_edit.text())
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
 # Background threads
 # ---------------------------------------------------------------------------
 
 class BagInspectThread(QThread):
     """Inspect MCAP bags in the background to discover topics."""
-    result_ready = Signal(dict)       # {bag_path: [TopicInfo, ...]}
+    result_ready = Signal(dict, dict)  # {bag_path: [TopicInfo, ...]}, {bag_path: duration}
     error_occurred = Signal(str)
     progress = Signal(str)
 
@@ -72,16 +152,19 @@ class BagInspectThread(QThread):
 
     def run(self):
         results: Dict[str, List[TopicInfo]] = {}
+        durations: Dict[str, float] = {}
         for i, path in enumerate(self.bag_paths):
             name = Path(path).name
             self.progress.emit(f"Inspecting {name} ({i + 1}/{len(self.bag_paths)})...")
             try:
-                topics = inspect_bag(path)
-                results[path] = topics
+                summary = inspect_bag(path)
+                results[path] = summary.topics
+                durations[path] = summary.duration
             except Exception as e:
                 self.error_occurred.emit(f"Error inspecting {name}: {e}")
                 results[path] = []
-        self.result_ready.emit(results)
+                durations[path] = 0.0
+        self.result_ready.emit(results, durations)
 
 
 class ExtractionThread(QThread):
@@ -127,14 +210,59 @@ class McapImageExtractorGUI(QWidget):
         self.setGeometry(100, 80, 900, 820)
         self.setMinimumSize(750, 650)
 
+        # Persistent settings
+        self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+
         # State
         self.bag_paths: List[str] = []
         self.all_topics: Dict[str, List[TopicInfo]] = {}   # per-bag topics
+        self.bag_durations: Dict[str, float] = {}           # per-bag duration (sec)
         self.merged_topics: List[TopicInfo] = []
         self.inspect_thread: Optional[BagInspectThread] = None
         self.extract_thread: Optional[ExtractionThread] = None
 
+        # Calibration state
+        self.calibrations: Dict[str, CameraIntrinsics] = {}  # camera_name → intrinsics
+        self.calib_mapping: Dict[str, str] = {}               # topic → camera_name
+
         self._build_ui()
+        self._load_preferences()
+
+    # ----- preferences -----
+
+    def _load_preferences(self):
+        """Populate fields from saved QSettings."""
+        default_output = self.settings.value(PREF_OUTPUT_DIR, '')
+        if default_output:
+            self.output_dir_edit.setText(default_output)
+
+        calib_dir = self.settings.value(
+            PREF_CALIBRATION_DIR, DEFAULT_CALIBRATION_DIR)
+        if calib_dir and Path(calib_dir).is_dir():
+            self.calibrations = scan_calibration_dir(calib_dir)
+            self.calib_dir_label.setText(calib_dir)
+
+    def _open_preferences(self):
+        dlg = PreferencesDialog(self.settings, parent=self)
+        if dlg.exec() == QDialog.Accepted:
+            # Refresh calibration data
+            calib_dir = self.settings.value(
+                PREF_CALIBRATION_DIR, DEFAULT_CALIBRATION_DIR)
+            if calib_dir and Path(calib_dir).is_dir():
+                self.calibrations = scan_calibration_dir(calib_dir)
+                self.calib_dir_label.setText(calib_dir)
+                self._log(f"Loaded {len(self.calibrations)} calibration(s) "
+                          f"from {calib_dir}")
+            else:
+                self.calibrations = {}
+                self.calib_dir_label.setText("(not set)")
+
+            # Refresh default output dir
+            default_output = self.settings.value(PREF_OUTPUT_DIR, '')
+            if default_output and not self.output_dir_edit.text().strip():
+                self.output_dir_edit.setText(default_output)
+
+            self._refresh_calibration_mapping()
 
     # ----- UI construction -----
 
@@ -143,11 +271,18 @@ class McapImageExtractorGUI(QWidget):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(8)
 
-        # Title
+        # Title row with Preferences button
+        title_row = QHBoxLayout()
         title = QLabel("MCAP Image Extractor")
         title.setFont(QFont("Segoe UI", 16, QFont.Bold))
-        title.setAlignment(Qt.AlignCenter)
-        root.addWidget(title)
+        title_row.addStretch()
+        title_row.addWidget(title)
+        title_row.addStretch()
+        self.prefs_btn = QPushButton("  Preferences  ")
+        self.prefs_btn.setMinimumHeight(30)
+        self.prefs_btn.clicked.connect(self._open_preferences)
+        title_row.addWidget(self.prefs_btn)
+        root.addLayout(title_row)
 
         subtitle = QLabel("Extract image frames from ROS 2 bags for CVAT labeling")
         subtitle.setAlignment(Qt.AlignCenter)
@@ -173,6 +308,12 @@ class McapImageExtractorGUI(QWidget):
         # Output & Settings
         top_layout.addWidget(self._build_output_section())
         top_layout.addWidget(self._build_settings_section())
+
+        # Calibration / rectification
+        top_layout.addWidget(self._build_calibration_section())
+
+        # Extraction preview
+        top_layout.addWidget(self._build_preview_section())
 
         splitter.addWidget(top_widget)
 
@@ -309,6 +450,7 @@ class McapImageExtractorGUI(QWidget):
         self.interval_spin.setToolTip(
             "Minimum time gap between extracted frames.\n"
             "1.0 = ~1 frame per second, avoids near-duplicate frames.")
+        self.interval_spin.valueChanged.connect(lambda _: self._update_preview())
         grid.addWidget(self.interval_spin, 0, 1)
 
         # Row 0: Image format
@@ -344,6 +486,50 @@ class McapImageExtractorGUI(QWidget):
 
         return group
 
+    def _build_calibration_section(self) -> QGroupBox:
+        group = QGroupBox("Image Rectification")
+        lay = QVBoxLayout(group)
+
+        # Top row: checkbox + calibration dir info
+        top_row = QHBoxLayout()
+        self.rectify_check = QCheckBox("Rectify images (undistort)")
+        self.rectify_check.setChecked(False)
+        self.rectify_check.setToolTip(
+            "Apply lens distortion correction using camera intrinsics.\n"
+            "Requires calibration YAML files.")
+        self.rectify_check.stateChanged.connect(self._on_rectify_changed)
+        top_row.addWidget(self.rectify_check)
+        top_row.addStretch()
+        top_row.addWidget(QLabel("Calibration dir:"))
+        self.calib_dir_label = QLabel("(not set)")
+        self.calib_dir_label.setStyleSheet("color: #aaa;")
+        top_row.addWidget(self.calib_dir_label)
+        lay.addLayout(top_row)
+
+        # Mapping table: topic → calibration file
+        self.calib_table = QTableWidget(0, 3)
+        self.calib_table.setHorizontalHeaderLabels(
+            ['Image Topic', 'Calibration File', ''])
+        header = self.calib_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.calib_table.verticalHeader().setVisible(False)
+        self.calib_table.setMaximumHeight(140)
+        self.calib_table.setVisible(False)
+        lay.addWidget(self.calib_table)
+
+        return group
+
+    def _build_preview_section(self) -> QGroupBox:
+        group = QGroupBox("Extraction Preview")
+        lay = QVBoxLayout(group)
+        self.preview_label = QLabel("Select image topics and bags to see an estimate.")
+        self.preview_label.setWordWrap(True)
+        self.preview_label.setStyleSheet("color: #ccc; padding: 4px;")
+        lay.addWidget(self.preview_label)
+        return group
+
     # ----- event handlers -----
 
     def _add_bags(self):
@@ -363,10 +549,14 @@ class McapImageExtractorGUI(QWidget):
         for p in new_paths:
             self.bag_list.addItem(Path(p).name)
 
-        # Auto-set output dir to first bag's parent
+        # Auto-set output dir: prefer preferences default, then bag parent
         if not self.output_dir_edit.text():
-            parent = str(Path(new_paths[0]).parent / 'extracted')
-            self.output_dir_edit.setText(parent)
+            default_output = self.settings.value(PREF_OUTPUT_DIR, '')
+            if default_output:
+                self.output_dir_edit.setText(default_output)
+            else:
+                parent = str(Path(new_paths[0]).parent / 'extracted')
+                self.output_dir_edit.setText(parent)
 
         # Inspect new bags
         self._inspect_bags(new_paths)
@@ -381,15 +571,22 @@ class McapImageExtractorGUI(QWidget):
             self.bag_paths.pop(row)
             self.bag_list.takeItem(row)
             self.all_topics.pop(path, None)
+            self.bag_durations.pop(path, None)
         self._rebuild_topic_list()
+        self._update_preview()
+        self._refresh_calibration_mapping()
 
     def _clear_bags(self):
         self.bag_paths.clear()
         self.bag_list.clear()
         self.all_topics.clear()
+        self.bag_durations.clear()
         self.merged_topics.clear()
         self.topic_list.clear()
+        self.calib_mapping.clear()
         self.extract_btn.setEnabled(False)
+        self._update_preview()
+        self._refresh_calibration_mapping()
 
     def _browse_output(self):
         d = QFileDialog.getExistingDirectory(self, "Select Output Directory")
@@ -414,6 +611,8 @@ class McapImageExtractorGUI(QWidget):
 
     def _on_topic_changed(self, item: QListWidgetItem):
         self._update_extract_button()
+        self._update_preview()
+        self._refresh_calibration_mapping()
 
     def _update_extract_button(self):
         has_checked = any(
@@ -424,6 +623,150 @@ class McapImageExtractorGUI(QWidget):
         not_running = (self.extract_thread is None
                        or not self.extract_thread.isRunning())
         self.extract_btn.setEnabled(has_checked and has_output and not_running)
+
+    def _update_preview(self):
+        """Recompute and display estimated image counts per topic and total."""
+        interval = self.interval_spin.value()
+
+        # Gather selected image topics
+        selected_image_topics: List[str] = []
+        for i in range(self.topic_list.count()):
+            item = self.topic_list.item(i)
+            if (item.checkState() == Qt.Checked
+                    and item.data(Qt.UserRole) == 'image'):
+                selected_image_topics.append(item.data(Qt.UserRole + 1))
+
+        if not selected_image_topics:
+            self.preview_label.setText(
+                "Select image topics and bags to see an estimate.")
+            return
+
+        # Estimate per-topic across all bags
+        per_topic: Dict[str, int] = {}
+        for topic_name in selected_image_topics:
+            total_est = 0
+            for bag_path, topics in self.all_topics.items():
+                duration = self.bag_durations.get(bag_path, 0.0)
+                for t in topics:
+                    if t.name == topic_name and t.category == 'image':
+                        if duration > 0 and t.message_count > 0:
+                            max_at_interval = int(duration / interval) + 1
+                            total_est += min(t.message_count, max_at_interval)
+                        else:
+                            # No duration info; fall back to message count
+                            total_est += t.message_count
+                        break
+            per_topic[topic_name] = total_est
+
+        grand_total = sum(per_topic.values())
+
+        # Build display text
+        lines = []
+        for topic_name, est in per_topic.items():
+            lines.append(f"  {topic_name}:  ~{est:,} images")
+        lines.append(f"\n  Total:  ~{grand_total:,} images")
+
+        self.preview_label.setText(
+            f"Estimated output at {interval:.1f}s interval:\n"
+            + "\n".join(lines)
+        )
+
+    # ----- calibration / rectification -----
+
+    def _on_rectify_changed(self, state: int):
+        enabled = bool(state)
+        self.calib_table.setVisible(enabled)
+        if enabled:
+            self._refresh_calibration_mapping()
+
+    def _refresh_calibration_mapping(self):
+        """Re-run auto-mapping and update the calibration table."""
+        # Gather currently checked image topics
+        image_topics: List[str] = []
+        for i in range(self.topic_list.count()):
+            item = self.topic_list.item(i)
+            if (item.checkState() == Qt.Checked
+                    and item.data(Qt.UserRole) == 'image'):
+                image_topics.append(item.data(Qt.UserRole + 1))
+
+        # Auto-map
+        if self.calibrations:
+            auto = auto_map_topics_to_calibrations(
+                image_topics, self.calibrations)
+            # Merge: keep any manual overrides that are still valid
+            new_mapping: Dict[str, str] = {}
+            for topic in image_topics:
+                if topic in self.calib_mapping and \
+                        self.calib_mapping[topic] in self.calibrations:
+                    new_mapping[topic] = self.calib_mapping[topic]
+                elif topic in auto:
+                    new_mapping[topic] = auto[topic]
+            self.calib_mapping = new_mapping
+        else:
+            # Keep only entries whose topics are still selected
+            self.calib_mapping = {
+                t: c for t, c in self.calib_mapping.items()
+                if t in image_topics
+            }
+
+        self._rebuild_calib_table(image_topics)
+
+    def _rebuild_calib_table(self, image_topics: List[str]):
+        """Populate the calibration mapping table."""
+        self.calib_table.setRowCount(len(image_topics))
+        for row, topic in enumerate(image_topics):
+            # Column 0: topic name (read-only)
+            topic_item = QTableWidgetItem(topic)
+            topic_item.setFlags(topic_item.flags() & ~Qt.ItemIsEditable)
+            self.calib_table.setItem(row, 0, topic_item)
+
+            # Column 1: mapped calibration file
+            cam_name = self.calib_mapping.get(topic, '')
+            if cam_name and cam_name in self.calibrations:
+                calib = self.calibrations[cam_name]
+                display = f"{cam_name}  ({calib.distortion_model})"
+                calib_item = QTableWidgetItem(display)
+                calib_item.setForeground(QColor('#81c784'))
+            else:
+                calib_item = QTableWidgetItem("— unmapped —")
+                calib_item.setForeground(QColor('#ef5350'))
+            calib_item.setFlags(calib_item.flags() & ~Qt.ItemIsEditable)
+            self.calib_table.setItem(row, 1, calib_item)
+
+            # Column 2: browse button
+            browse_btn = QPushButton("...")
+            browse_btn.setToolTip("Manually select a calibration YAML file")
+            browse_btn.setMaximumWidth(32)
+            browse_btn.clicked.connect(
+                lambda checked=False, t=topic: self._manual_set_calibration(t))
+            self.calib_table.setCellWidget(row, 2, browse_btn)
+
+    def _manual_set_calibration(self, topic: str):
+        """Let the user pick a specific intrinsics YAML for a topic."""
+        calib_dir = self.settings.value(
+            PREF_CALIBRATION_DIR, DEFAULT_CALIBRATION_DIR)
+        path, _ = QFileDialog.getOpenFileName(
+            self, f"Select Calibration for {topic}",
+            calib_dir,
+            "YAML files (*.yaml *.yml);;All files (*.*)",
+        )
+        if not path:
+            return
+
+        from .extractor import load_intrinsics_yaml
+        intr = load_intrinsics_yaml(path)
+        if intr is None or not intr.camera_name:
+            QMessageBox.warning(
+                self, "Invalid File",
+                f"Could not parse camera intrinsics from:\n{path}")
+            return
+
+        # Register in calibrations dict and mapping
+        self.calibrations[intr.camera_name] = intr
+        self.calib_mapping[topic] = intr.camera_name
+        self._log(f"Mapped {topic} → {intr.camera_name} "
+                  f"({intr.distortion_model}) from {Path(path).name}")
+        self._refresh_calibration_mapping()
 
     # ----- bag inspection -----
 
@@ -439,14 +782,19 @@ class McapImageExtractorGUI(QWidget):
             lambda: self._set_controls_enabled(True))
         self.inspect_thread.start()
 
-    def _on_inspect_done(self, results: Dict[str, List[TopicInfo]]):
+    def _on_inspect_done(self, results: Dict[str, List[TopicInfo]],
+                         durations: Dict[str, float]):
         self.all_topics.update(results)
+        self.bag_durations.update(durations)
         for path, topics in results.items():
             name = Path(path).name
+            dur = durations.get(path, 0.0)
             count = sum(t.message_count for t in topics)
             self._log(f"Loaded {name}: {len(topics)} topics, "
-                      f"{count:,} messages")
+                      f"{count:,} messages, {dur:.1f}s duration")
         self._rebuild_topic_list()
+        self._update_preview()
+        self._refresh_calibration_mapping()
         self.status_label.setText("Ready")
 
     def _on_inspect_error(self, msg: str):
@@ -554,6 +902,29 @@ class McapImageExtractorGUI(QWidget):
                 "Please select at least one image or pointcloud topic.")
             return
 
+        # Build calibration map for extraction
+        do_rectify = self.rectify_check.isChecked()
+        calibration_map: Dict[str, CameraIntrinsics] = {}
+        if do_rectify:
+            unmapped = []
+            for topic in image_topics:
+                cam_name = self.calib_mapping.get(topic)
+                if cam_name and cam_name in self.calibrations:
+                    calibration_map[topic] = self.calibrations[cam_name]
+                else:
+                    unmapped.append(topic)
+            if unmapped:
+                reply = QMessageBox.question(
+                    self, "Unmapped Topics",
+                    f"The following image topics have no calibration mapping "
+                    f"and will NOT be rectified:\n\n"
+                    + "\n".join(f"  • {t}" for t in unmapped)
+                    + "\n\nContinue anyway?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+                )
+                if reply == QMessageBox.No:
+                    return
+
         config = ExtractionConfig(
             bag_paths=list(self.bag_paths),
             output_dir=output_dir,
@@ -567,6 +938,8 @@ class McapImageExtractorGUI(QWidget):
             jpeg_quality=self.quality_spin.value(),
             generate_metadata_csv=self.csv_check.isChecked(),
             extract_pointclouds=self.pointcloud_check.isChecked(),
+            rectify=do_rectify,
+            calibration_map=calibration_map,
         )
 
         self._log("\n" + "=" * 60)
@@ -578,6 +951,8 @@ class McapImageExtractorGUI(QWidget):
         self._log(f"  Pointcloud topics: {len(pc_topics)}")
         self._log(f"  Frame interval: {config.frame_interval:.1f}s")
         self._log(f"  Format: {config.image_format.upper()}")
+        self._log(f"  Rectify: {do_rectify}"
+                  + (f" ({len(calibration_map)} mapped)" if do_rectify else ""))
         self._log(f"  Output: {output_dir}")
         self._log("=" * 60)
 
@@ -657,6 +1032,8 @@ class McapImageExtractorGUI(QWidget):
         self.quality_spin.setEnabled(enabled)
         self.csv_check.setEnabled(enabled)
         self.pointcloud_check.setEnabled(enabled)
+        self.rectify_check.setEnabled(enabled)
+        self.calib_table.setEnabled(enabled)
         # Buttons in bag section
         for btn in self.findChildren(QPushButton):
             if btn not in (self.cancel_btn,):

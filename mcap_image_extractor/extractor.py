@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 import cv2
 import numpy as np
+import yaml
 
 from mcap.reader import make_reader
 from mcap_ros2.decoder import DecoderFactory
@@ -79,6 +80,18 @@ class TopicInfo:
 
 
 @dataclass
+class CameraIntrinsics:
+    """Parsed camera intrinsics from a calibration YAML file."""
+    camera_name: str
+    image_width: int
+    image_height: int
+    camera_matrix: np.ndarray        # 3x3
+    distortion_model: str            # 'equidistant', 'rational_polynomial', …
+    distortion_coefficients: np.ndarray
+    source_file: str = ''            # path to the YAML file
+
+
+@dataclass
 class ExtractionConfig:
     """Configuration for the extraction pipeline."""
     bag_paths: List[str]
@@ -93,6 +106,9 @@ class ExtractionConfig:
     jpeg_quality: int = 95           # 1-100, only used for JPEG
     generate_metadata_csv: bool = True
     extract_pointclouds: bool = False
+    rectify: bool = False
+    # topic → CameraIntrinsics mapping (only used when rectify=True)
+    calibration_map: Dict[str, 'CameraIntrinsics'] = field(default_factory=dict)
 
 
 @dataclass
@@ -112,22 +128,38 @@ class ExtractionStats:
 # Bag inspection
 # ---------------------------------------------------------------------------
 
-def inspect_bag(bag_path: str) -> List[TopicInfo]:
+@dataclass
+class BagSummary:
+    """Summary information for an inspected MCAP bag."""
+    topics: List[TopicInfo]
+    duration: float  # bag duration in seconds (0.0 if unknown)
+
+
+def inspect_bag(bag_path: str) -> BagSummary:
     """
-    Read an MCAP file and return a list of all available topics.
+    Read an MCAP file and return topic info plus the bag duration.
 
     Args:
         bag_path: Path to the .mcap file.
 
     Returns:
-        Sorted list of TopicInfo objects.
+        A BagSummary with sorted topics and duration in seconds.
     """
     topics: List[TopicInfo] = []
+    duration = 0.0
+
     with open(bag_path, 'rb') as f:
         reader = make_reader(f)
         summary = reader.get_summary()
         if not summary:
-            return topics
+            return BagSummary(topics=topics, duration=duration)
+
+        # Compute bag duration from statistics
+        if summary.statistics:
+            start_ns = summary.statistics.message_start_time
+            end_ns = summary.statistics.message_end_time
+            if end_ns > start_ns:
+                duration = (end_ns - start_ns) * 1e-9
 
         for channel_id, channel in summary.channels.items():
             schema = summary.schemas.get(channel.schema_id)
@@ -146,7 +178,10 @@ def inspect_bag(bag_path: str) -> List[TopicInfo]:
                 category=categorize_topic(msg_type),
             ))
 
-    return sorted(topics, key=lambda t: t.name)
+    return BagSummary(
+        topics=sorted(topics, key=lambda t: t.name),
+        duration=duration,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +318,148 @@ def save_image(img: np.ndarray, path: str, fmt: str,
     except Exception as e:
         logger.error("Failed to save image %s: %s", path, e)
         return False
+
+
+# ---------------------------------------------------------------------------
+# Camera calibration loading and image rectification
+# ---------------------------------------------------------------------------
+
+def load_intrinsics_yaml(yaml_path: str) -> Optional[CameraIntrinsics]:
+    """Parse a ``*.intrinsics.yaml`` calibration file.
+
+    Expected YAML keys: ``camera_name``, ``image_width``, ``image_height``,
+    ``camera_matrix`` (with ``data``), ``distortion_model``,
+    ``distortion_coefficients`` (with ``data``).
+    """
+    try:
+        with open(yaml_path, 'r') as f:
+            data = yaml.safe_load(f)
+        if data is None:
+            return None
+
+        cam_matrix = np.array(
+            data['camera_matrix']['data'], dtype=np.float64,
+        ).reshape(3, 3)
+
+        dist_coeffs = np.array(
+            data['distortion_coefficients']['data'], dtype=np.float64,
+        )
+
+        return CameraIntrinsics(
+            camera_name=data.get('camera_name', ''),
+            image_width=int(data.get('image_width', 0)),
+            image_height=int(data.get('image_height', 0)),
+            camera_matrix=cam_matrix,
+            distortion_model=data.get('distortion_model', ''),
+            distortion_coefficients=dist_coeffs,
+            source_file=yaml_path,
+        )
+    except Exception as e:
+        logger.warning("Failed to load intrinsics from %s: %s", yaml_path, e)
+        return None
+
+
+def scan_calibration_dir(
+    dir_path: str,
+) -> Dict[str, CameraIntrinsics]:
+    """Scan a directory for ``*.intrinsics.yaml`` files.
+
+    Returns:
+        Dict mapping ``camera_name`` → :class:`CameraIntrinsics`.
+    """
+    result: Dict[str, CameraIntrinsics] = {}
+    cal_dir = Path(dir_path)
+    if not cal_dir.is_dir():
+        return result
+
+    for p in sorted(cal_dir.glob('*.intrinsics.yaml')):
+        intr = load_intrinsics_yaml(str(p))
+        if intr and intr.camera_name:
+            result[intr.camera_name] = intr
+
+    return result
+
+
+def auto_map_topics_to_calibrations(
+    image_topics: List[str],
+    calibrations: Dict[str, CameraIntrinsics],
+) -> Dict[str, str]:
+    """Try to automatically match image topics to camera calibration names.
+
+    Heuristic:
+      1. For ``/camera/{label}/…`` topics build ``camera_{label}`` and look
+         for an exact ``camera_name`` match.
+      2. Fall back to checking whether any ``camera_name`` appears as a
+         substring of the topic (handles ZED-style names, etc.).
+
+    Returns:
+        Dict mapping **topic** → **camera_name** for every topic that could
+        be matched.  Topics without a match are omitted.
+    """
+    mapping: Dict[str, str] = {}
+    cam_names = list(calibrations.keys())
+
+    for topic in image_topics:
+        parts = [p for p in topic.split('/') if p]
+
+        # Strategy 1: /camera/{label}/… → camera_{label}
+        matched = False
+        if len(parts) >= 2 and parts[0] == 'camera':
+            candidate = f"camera_{parts[1]}"
+            if candidate in calibrations:
+                mapping[topic] = candidate
+                matched = True
+
+        # Strategy 2: substring match of camera_name in the full topic
+        if not matched:
+            for cname in cam_names:
+                # Build tokens from camera_name for flexible matching
+                # e.g. "zed_left_camera" → check if topic contains "zed_left"
+                # or the full name
+                name_tokens = cname.replace('camera_', '').replace('_camera', '')
+                if cname in topic.replace('/', '_') or name_tokens in topic.replace('/', '_'):
+                    mapping[topic] = cname
+                    break
+
+    return mapping
+
+
+def rectify_image(
+    img: np.ndarray,
+    intrinsics: CameraIntrinsics,
+) -> np.ndarray:
+    """Undistort / rectify an image using the given camera intrinsics.
+
+    Supports ``equidistant`` / ``fisheye`` and ``rational_polynomial``
+    distortion models.  Unknown models return the image unchanged.
+    """
+    K = intrinsics.camera_matrix
+    D = intrinsics.distortion_coefficients
+    model = intrinsics.distortion_model.lower()
+
+    try:
+        if model in ('equidistant', 'fisheye', 'kannala_brandt'):
+            # Use fisheye undistort with reduced FOV to avoid black edges
+            Knew = K.copy()
+            Knew[0, 0] *= 0.5
+            Knew[1, 1] *= 0.5
+            return cv2.fisheye.undistortImage(
+                img, K=K, D=D[:4], Knew=Knew,
+            )
+
+        if model in ('rational_polynomial', 'plumb_bob'):
+            if np.allclose(D, 0):
+                return img  # already undistorted
+            h, w = img.shape[:2]
+            new_K, _roi = cv2.getOptimalNewCameraMatrix(
+                K, D, (w, h), 1, (w, h),
+            )
+            return cv2.undistort(img, K, D, None, new_K)
+
+    except Exception as e:
+        logger.warning("Rectification failed (%s): %s", model, e)
+
+    return img
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +793,10 @@ class McapImageExtractor:
         if img is None:
             self.stats.images_skipped += 1
             return
+
+        # Optional rectification
+        if self.config.rectify and topic in self.config.calibration_map:
+            img = rectify_image(img, self.config.calibration_map[topic])
 
         frame_counters.setdefault(topic, 0)
         frame_counters[topic] += 1

@@ -18,6 +18,7 @@ setup(
         'numpy',
         'opencv-python',
         'PySide6',
+        'PyYAML',
         'qt-material',
     ],
     zip_safe=True,
