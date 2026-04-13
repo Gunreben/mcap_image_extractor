@@ -315,6 +315,9 @@ class McapImageExtractorGUI(QWidget):
         # Extraction preview
         top_layout.addWidget(self._build_preview_section())
 
+        # Now that all widgets exist, sync the mode-dependent visibility
+        self._on_export_mode_changed(self.export_mode_combo.currentIndex())
+
         splitter.addWidget(top_widget)
 
         # --- Bottom section (progress + log) ---
@@ -441,8 +444,18 @@ class McapImageExtractorGUI(QWidget):
         group = QGroupBox("Extraction Settings")
         grid = QGridLayout(group)
 
+        # Row 0: Sampling mode
+        grid.addWidget(QLabel("Sampling mode:"), 0, 0)
+        self.export_mode_combo = QComboBox()
+        self.export_mode_combo.addItem("Fixed interval", userData='interval')
+        self.export_mode_combo.addItem("Random count", userData='random_count')
+        self.export_mode_combo.currentIndexChanged.connect(
+            self._on_export_mode_changed)
+        grid.addWidget(self.export_mode_combo, 0, 1)
+
         # Row 0: Frame interval
-        grid.addWidget(QLabel("Frame interval (sec):"), 0, 0)
+        self.interval_label = QLabel("Frame interval (sec):")
+        grid.addWidget(self.interval_label, 0, 2)
         self.interval_spin = QDoubleSpinBox()
         self.interval_spin.setRange(0.1, 60.0)
         self.interval_spin.setValue(1.0)
@@ -451,38 +464,53 @@ class McapImageExtractorGUI(QWidget):
             "Minimum time gap between extracted frames.\n"
             "1.0 = ~1 frame per second, avoids near-duplicate frames.")
         self.interval_spin.valueChanged.connect(lambda _: self._update_preview())
-        grid.addWidget(self.interval_spin, 0, 1)
+        grid.addWidget(self.interval_spin, 0, 3)
 
-        # Row 0: Image format
-        grid.addWidget(QLabel("Image format:"), 0, 2)
+        # Row 0: Random sample count
+        self.random_count_label = QLabel("Images per topic:")
+        grid.addWidget(self.random_count_label, 0, 4)
+        self.random_count_spin = QSpinBox()
+        self.random_count_spin.setRange(1, 1_000_000)
+        self.random_count_spin.setValue(50)
+        self.random_count_spin.setToolTip(
+            "Export this many images per selected image topic.\n"
+            "The extractor picks shared random timestamps and matches each "
+            "topic as closely as possible.")
+        self.random_count_spin.valueChanged.connect(lambda _: self._update_preview())
+        grid.addWidget(self.random_count_spin, 0, 5)
+        self.random_count_label.setVisible(False)
+        self.random_count_spin.setVisible(False)
+
+        # Row 1: Image format
+        grid.addWidget(QLabel("Image format:"), 1, 0)
         self.format_combo = QComboBox()
         self.format_combo.addItems(['png', 'jpg'])
         self.format_combo.currentTextChanged.connect(self._on_format_changed)
-        grid.addWidget(self.format_combo, 0, 3)
+        grid.addWidget(self.format_combo, 1, 1)
 
-        # Row 0: JPEG quality
+        # Row 1: JPEG quality
         self.quality_label = QLabel("JPEG quality:")
-        grid.addWidget(self.quality_label, 0, 4)
+        grid.addWidget(self.quality_label, 1, 2)
         self.quality_spin = QSpinBox()
         self.quality_spin.setRange(1, 100)
         self.quality_spin.setValue(95)
-        grid.addWidget(self.quality_spin, 0, 5)
+        grid.addWidget(self.quality_spin, 1, 3)
         # Initially hidden (PNG default)
         self.quality_label.setVisible(False)
         self.quality_spin.setVisible(False)
 
-        # Row 1: checkboxes
+        # Row 2: checkboxes
         self.csv_check = QCheckBox("Generate metadata CSV")
         self.csv_check.setChecked(True)
         self.csv_check.setToolTip(
             "Create metadata.csv with filename, timestamp, GPS, heading, speed")
-        grid.addWidget(self.csv_check, 1, 0, 1, 2)
+        grid.addWidget(self.csv_check, 2, 0, 1, 2)
 
         self.pointcloud_check = QCheckBox("Extract pointclouds (PLY)")
         self.pointcloud_check.setChecked(False)
         self.pointcloud_check.setToolTip(
             "Save selected PointCloud2 topics as binary PLY files")
-        grid.addWidget(self.pointcloud_check, 1, 2, 1, 2)
+        grid.addWidget(self.pointcloud_check, 2, 2, 1, 2)
 
         return group
 
@@ -598,6 +626,43 @@ class McapImageExtractorGUI(QWidget):
         self.quality_label.setVisible(is_jpeg)
         self.quality_spin.setVisible(is_jpeg)
 
+    def _on_export_mode_changed(self, _index: int):
+        is_interval = self._current_export_mode() == 'interval'
+        self.interval_label.setVisible(is_interval)
+        self.interval_spin.setVisible(is_interval)
+        self.random_count_label.setVisible(not is_interval)
+        self.random_count_spin.setVisible(not is_interval)
+        self._update_preview()
+
+    def _current_export_mode(self) -> str:
+        return self.export_mode_combo.currentData()
+
+    def _selected_image_topics(self) -> List[str]:
+        topics: List[str] = []
+        for i in range(self.topic_list.count()):
+            item = self.topic_list.item(i)
+            if (item.checkState() == Qt.Checked
+                    and item.data(Qt.UserRole) == 'image'):
+                topics.append(item.data(Qt.UserRole + 1))
+        return topics
+
+    def _compute_random_capacity(self, image_topics: List[str]) -> int:
+        """Max shared random samples available across the selected bags."""
+        if not image_topics:
+            return 0
+
+        total_capacity = 0
+        selected_set = set(image_topics)
+        for topics in self.all_topics.values():
+            per_bag_counts: Dict[str, int] = {}
+            for topic in topics:
+                if topic.name in selected_set and topic.category == 'image':
+                    per_bag_counts[topic.name] = topic.message_count
+            if len(per_bag_counts) == len(selected_set):
+                total_capacity += min(per_bag_counts.values())
+
+        return total_capacity
+
     def _select_category(self, category: str):
         for i in range(self.topic_list.count()):
             item = self.topic_list.item(i)
@@ -626,20 +691,37 @@ class McapImageExtractorGUI(QWidget):
 
     def _update_preview(self):
         """Recompute and display estimated image counts per topic and total."""
-        interval = self.interval_spin.value()
-
-        # Gather selected image topics
-        selected_image_topics: List[str] = []
-        for i in range(self.topic_list.count()):
-            item = self.topic_list.item(i)
-            if (item.checkState() == Qt.Checked
-                    and item.data(Qt.UserRole) == 'image'):
-                selected_image_topics.append(item.data(Qt.UserRole + 1))
+        selected_image_topics = self._selected_image_topics()
 
         if not selected_image_topics:
             self.preview_label.setText(
                 "Select image topics and bags to see an estimate.")
             return
+
+        if self._current_export_mode() == 'random_count':
+            requested = self.random_count_spin.value()
+            capacity = self._compute_random_capacity(selected_image_topics)
+            lines = [
+                f"  {topic_name}:  target {requested:,} images"
+                for topic_name in selected_image_topics
+            ]
+            lines.append(
+                f"\n  Total target:  {requested * len(selected_image_topics):,} images"
+            )
+            lines.append(
+                f"  Shared random timestamps available:  {capacity:,}"
+            )
+            if capacity < requested:
+                lines.append(
+                    "  Warning: lower the requested count or select fewer topics."
+                )
+
+            self.preview_label.setText(
+                "Random sampling preview:\n" + "\n".join(lines)
+            )
+            return
+
+        interval = self.interval_spin.value()
 
         # Estimate per-topic across all bags
         per_topic: Dict[str, int] = {}
@@ -902,6 +984,26 @@ class McapImageExtractorGUI(QWidget):
                 "Please select at least one image or pointcloud topic.")
             return
 
+        export_mode = self._current_export_mode()
+        random_sample_count = self.random_count_spin.value()
+        if export_mode == 'random_count' and image_topics:
+            capacity = self._compute_random_capacity(image_topics)
+            if capacity <= 0:
+                QMessageBox.warning(
+                    self, "Random Export Unavailable",
+                    "Random export needs at least one bag that contains all "
+                    "selected image topics."
+                )
+                return
+            if random_sample_count > capacity:
+                QMessageBox.warning(
+                    self, "Random Export Count Too Large",
+                    f"Requested {random_sample_count:,} images per topic, but "
+                    f"only {capacity:,} shared timestamps are available across "
+                    "the selected bags/topics."
+                )
+                return
+
         # Build calibration map for extraction
         do_rectify = self.rectify_check.isChecked()
         calibration_map: Dict[str, CameraIntrinsics] = {}
@@ -933,7 +1035,9 @@ class McapImageExtractorGUI(QWidget):
             imu_topics=imu_topics,
             pointcloud_topics=pc_topics,
             odom_topics=odom_topics,
+            export_mode=export_mode,
             frame_interval=self.interval_spin.value(),
+            random_sample_count=random_sample_count,
             image_format=self.format_combo.currentText(),
             jpeg_quality=self.quality_spin.value(),
             generate_metadata_csv=self.csv_check.isChecked(),
@@ -949,7 +1053,12 @@ class McapImageExtractorGUI(QWidget):
         self._log(f"  GPS topics: {len(gps_topics)}")
         self._log(f"  Odom topics: {len(odom_topics)}")
         self._log(f"  Pointcloud topics: {len(pc_topics)}")
-        self._log(f"  Frame interval: {config.frame_interval:.1f}s")
+        if config.export_mode == 'interval':
+            self._log(f"  Sampling: interval ({config.frame_interval:.1f}s)")
+        else:
+            self._log(
+                f"  Sampling: random ({config.random_sample_count:,} images/topic)"
+            )
         self._log(f"  Format: {config.image_format.upper()}")
         self._log(f"  Rectify: {do_rectify}"
                   + (f" ({len(calibration_map)} mapped)" if do_rectify else ""))
@@ -1027,7 +1136,9 @@ class McapImageExtractorGUI(QWidget):
         self.bag_list.setEnabled(enabled)
         self.topic_list.setEnabled(enabled)
         self.output_dir_edit.setEnabled(enabled)
+        self.export_mode_combo.setEnabled(enabled)
         self.interval_spin.setEnabled(enabled)
+        self.random_count_spin.setEnabled(enabled)
         self.format_combo.setEnabled(enabled)
         self.quality_spin.setEnabled(enabled)
         self.csv_check.setEnabled(enabled)

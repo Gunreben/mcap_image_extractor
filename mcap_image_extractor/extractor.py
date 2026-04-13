@@ -10,10 +10,12 @@ import bisect
 import csv
 import logging
 import math
+import random
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
+from urllib.parse import quote
 
 import cv2
 import numpy as np
@@ -101,7 +103,9 @@ class ExtractionConfig:
     imu_topics: List[str] = field(default_factory=list)
     pointcloud_topics: List[str] = field(default_factory=list)
     odom_topics: List[str] = field(default_factory=list)
+    export_mode: str = 'interval'   # 'interval' or 'random_count'
     frame_interval: float = 1.0      # seconds between extracted frames
+    random_sample_count: int = 50    # images to export per topic in random mode
     image_format: str = 'png'        # 'png' or 'jpg'
     jpeg_quality: int = 95           # 1-100, only used for JPEG
     generate_metadata_csv: bool = True
@@ -196,6 +200,32 @@ def sanitize_topic_name(topic: str) -> str:
 def stamp_to_sec(stamp) -> float:
     """Convert a ROS2 Time stamp to seconds since epoch."""
     return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+
+
+def stamp_to_ns(stamp) -> int:
+    """Convert a ROS2 Time stamp to integer nanoseconds since epoch."""
+    return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+
+def stamp_ns_to_sec(stamp_ns: int) -> float:
+    """Convert integer nanoseconds since epoch to seconds."""
+    return float(stamp_ns) * 1e-9
+
+
+def format_timestamp_ns(stamp_ns: int) -> str:
+    """Format nanoseconds since epoch as ``sec.nanosec``."""
+    sec, nanosec = divmod(int(stamp_ns), 1_000_000_000)
+    return f"{sec}.{nanosec:09d}"
+
+
+def encode_topic_for_filename(topic: str) -> str:
+    """Percent-encode a topic name so the exact topic is preserved in filenames."""
+    return quote(topic, safe='')
+
+
+def build_image_filename(topic: str, stamp_ns: int, ext: str) -> str:
+    """Build a reversible filename containing the exact topic and timestamp."""
+    return f"{encode_topic_for_filename(topic)}__{format_timestamp_ns(stamp_ns)}.{ext}"
 
 
 def find_nearest(sorted_data: List[Dict], target_time: float,
@@ -628,7 +658,7 @@ class McapImageExtractor:
         self.stats = ExtractionStats()
         self._cancelled = False
 
-        output_dir = Path(self.config.output_dir)
+        output_dir = Path(self.config.output_dir).expanduser().resolve()
         images_dir = output_dir / 'images'
 
         # Create per-topic output directories for images
@@ -652,6 +682,14 @@ class McapImageExtractor:
 
         # Frame counters persist across bags to avoid filename collisions
         frame_counters: Dict[str, int] = {}
+        random_sampling_plans: Dict[str, Dict[str, Set[int]]] = {}
+
+        if self.config.export_mode == 'random_count' and self.config.image_topics:
+            self._progress(0.0, "Planning random image samples...")
+            random_sampling_plans = self._plan_random_sampling()
+            if not random_sampling_plans:
+                self._progress(0.0, "WARNING: random sampling plan is empty — "
+                               "no images will be exported.")
 
         total_bags = len(self.config.bag_paths)
         for bag_idx, bag_path in enumerate(self.config.bag_paths):
@@ -663,6 +701,7 @@ class McapImageExtractor:
                     images_dir, output_dir,
                     all_metadata, all_gps, all_odom,
                     frame_counters,
+                    random_sampling_plans.get(bag_path, {}),
                 )
                 self.stats.bags_processed += 1
             except Exception as e:
@@ -689,6 +728,7 @@ class McapImageExtractor:
         all_gps: List[Dict],
         all_odom: List[Dict],
         frame_counters: Dict[str, int],
+        random_sampling_plan: Dict[str, Set[int]],
     ):
         bag_name = Path(bag_path).stem
         self._progress(bag_idx / total_bags,
@@ -712,6 +752,7 @@ class McapImageExtractor:
 
         # Frame interval resets per bag (each bag is an independent recording)
         last_extract_time: Dict[str, float] = {}
+        image_message_indices: Dict[str, int] = {}
 
         msg_count = 0
         with open(bag_path, 'rb') as f:
@@ -739,11 +780,16 @@ class McapImageExtractor:
 
                 # --- Images ---
                 if topic in self.config.image_topics:
+                    image_message_indices.setdefault(topic, 0)
                     self._handle_image(
                         decoded, msg_type, topic, bag_name,
-                        images_dir, last_extract_time,
+                        images_dir, output_dir,
+                        last_extract_time,
                         frame_counters, all_metadata,
+                        random_sampling_plan,
+                        image_message_indices[topic],
                     )
+                    image_message_indices[topic] += 1
 
                 # --- GPS ---
                 elif topic in self.config.gps_topics:
@@ -776,18 +822,24 @@ class McapImageExtractor:
 
     def _handle_image(
         self, msg, msg_type: str, topic: str, bag_name: str,
-        images_dir: Path,
+        images_dir: Path, output_dir: Path,
         last_extract_time: Dict[str, float],
         frame_counters: Dict[str, int],
         all_metadata: List[Dict],
+        random_sampling_plan: Dict[str, Set[int]],
+        image_message_index: int,
     ):
-        timestamp = stamp_to_sec(msg.header.stamp)
+        stamp_ns = stamp_to_ns(msg.header.stamp)
+        timestamp = stamp_ns_to_sec(stamp_ns)
 
-        # Enforce frame interval
-        if topic in last_extract_time:
-            if timestamp - last_extract_time[topic] < self.config.frame_interval:
-                self.stats.images_skipped += 1
-                return
+        if self.config.export_mode == 'interval':
+            if topic in last_extract_time:
+                if timestamp - last_extract_time[topic] < self.config.frame_interval:
+                    self.stats.images_skipped += 1
+                    return
+        elif image_message_index not in random_sampling_plan.get(topic, set()):
+            self.stats.images_skipped += 1
+            return
 
         img = decode_image(msg, msg_type)
         if img is None:
@@ -804,7 +856,7 @@ class McapImageExtractor:
 
         ext = self.config.image_format
         topic_dir = images_dir / sanitize_topic_name(topic)
-        filename = f"{frame_num:07d}.{ext}"
+        filename = build_image_filename(topic, stamp_ns, ext)
         filepath = topic_dir / filename
 
         if save_image(img, str(filepath), ext, self.config.jpeg_quality):
@@ -812,15 +864,229 @@ class McapImageExtractor:
             last_extract_time[topic] = timestamp
             all_metadata.append({
                 'frame_id': frame_num,
-                'filename': str(filepath.relative_to(self.config.output_dir)),
+                'filename': str(filepath.relative_to(output_dir)),
                 'bag_file': bag_name,
                 'topic': topic,
                 'timestamp': timestamp,
+                'timestamp_ns': stamp_ns,
                 'width': img.shape[1],
                 'height': img.shape[0],
             })
         else:
             self.stats.errors.append(f"Failed to save {filepath}")
+
+    def _plan_random_sampling(self) -> Dict[str, Dict[str, Set[int]]]:
+        """Plan per-bag, per-topic image indices for random sampling."""
+        bag_topics: Dict[str, Dict[str, List[int]]] = {}
+        bag_capacities: Dict[str, int] = {}
+
+        total_bags = len(self.config.bag_paths)
+        for i, bag_path in enumerate(self.config.bag_paths):
+            bag_name = Path(bag_path).stem
+            self._progress(
+                0.0,
+                f"Collecting timestamps from {bag_name} "
+                f"({i + 1}/{total_bags})...",
+            )
+            topic_timestamps = self._collect_image_timestamps(bag_path)
+            bag_topics[bag_path] = topic_timestamps
+
+            for topic, ts_list in topic_timestamps.items():
+                self._progress(
+                    0.0,
+                    f"  {topic}: {len(ts_list):,} decoded messages",
+                )
+
+            bag_capacities[bag_path] = self._random_sampling_capacity(
+                topic_timestamps
+            )
+            self._progress(
+                0.0,
+                f"  {bag_name} sampling capacity: "
+                f"{bag_capacities[bag_path]:,}",
+            )
+
+        total_capacity = sum(bag_capacities.values())
+        if total_capacity <= 0:
+            warning = (
+                "Random sampling could not be planned: no bag contains "
+                "decodable messages for all selected image topics."
+            )
+            self._progress(0.0, f"ERROR: {warning}")
+            self.stats.errors.append(warning)
+            return {}
+
+        requested = min(self.config.random_sample_count, total_capacity)
+        if requested < self.config.random_sample_count:
+            self._progress(
+                0.0,
+                f"Note: requested {self.config.random_sample_count:,} samples "
+                f"per topic but only {requested:,} are available.",
+            )
+
+        allocations = self._allocate_random_counts(requested, bag_capacities)
+        plans: Dict[str, Dict[str, Set[int]]] = {}
+        for bag_path, topic_timestamps in bag_topics.items():
+            count = allocations.get(bag_path, 0)
+            if count <= 0:
+                continue
+            plans[bag_path] = self._build_bag_random_plan(topic_timestamps, count)
+
+        total_planned = sum(
+            len(indices)
+            for plan in plans.values()
+            for indices in plan.values()
+        )
+        self._progress(
+            0.0,
+            f"Random plan: {requested:,} samples/topic, "
+            f"{total_planned:,} total image slots across "
+            f"{len(plans)} bag(s)",
+        )
+        return plans
+
+    def _collect_image_timestamps(self, bag_path: str) -> Dict[str, List[int]]:
+        """Collect per-topic message log_times for the selected image topics.
+
+        Uses the MCAP message envelope ``log_time`` (always present) instead
+        of decoding each message, so this cannot silently fail.
+        """
+        image_topics = list(self.config.image_topics)
+        timestamps: Dict[str, List[int]] = {
+            topic: [] for topic in image_topics
+        }
+
+        with open(bag_path, 'rb') as f:
+            reader = make_reader(f, decoder_factories=[DecoderFactory()])
+            for _schema, channel, message, _decoded in (
+                reader.iter_decoded_messages(topics=image_topics)
+            ):
+                if channel.topic in timestamps:
+                    timestamps[channel.topic].append(message.log_time)
+
+        return timestamps
+
+    def _random_sampling_capacity(
+        self, topic_timestamps: Dict[str, List[int]]
+    ) -> int:
+        """Return the max shared random samples available for one bag."""
+        if not self.config.image_topics:
+            return 0
+        per_topic_counts = []
+        for topic in self.config.image_topics:
+            count = len(topic_timestamps.get(topic, []))
+            if count <= 0:
+                return 0
+            per_topic_counts.append(count)
+        return min(per_topic_counts)
+
+    def _allocate_random_counts(
+        self, requested: int, bag_capacities: Dict[str, int]
+    ) -> Dict[str, int]:
+        """Distribute requested random samples across bags by capacity."""
+        positive = {
+            bag_path: capacity
+            for bag_path, capacity in bag_capacities.items()
+            if capacity > 0
+        }
+        total_capacity = sum(positive.values())
+        if requested <= 0 or total_capacity <= 0:
+            return {}
+
+        allocations = {bag_path: 0 for bag_path in positive}
+        remainders = []
+        assigned = 0
+
+        for bag_path, capacity in positive.items():
+            exact = requested * capacity / total_capacity
+            base = min(capacity, int(math.floor(exact)))
+            allocations[bag_path] = base
+            assigned += base
+            remainders.append((exact - base, bag_path))
+
+        remaining = requested - assigned
+        for _fraction, bag_path in sorted(remainders, reverse=True):
+            if remaining <= 0:
+                break
+            if allocations[bag_path] >= positive[bag_path]:
+                continue
+            allocations[bag_path] += 1
+            remaining -= 1
+
+        if remaining > 0:
+            for bag_path in sorted(positive):
+                while remaining > 0 and allocations[bag_path] < positive[bag_path]:
+                    allocations[bag_path] += 1
+                    remaining -= 1
+
+        return allocations
+
+    def _build_bag_random_plan(
+        self, topic_timestamps: Dict[str, List[int]], count: int
+    ) -> Dict[str, Set[int]]:
+        """Pick shared timestamps, then match each topic to the nearest frame."""
+        if count <= 0:
+            return {}
+
+        anchor_topic = min(
+            self.config.image_topics,
+            key=lambda topic: len(topic_timestamps.get(topic, [])),
+        )
+        anchor_timestamps = topic_timestamps.get(anchor_topic, [])
+        anchor_indices = sorted(random.sample(range(len(anchor_timestamps)), count))
+        target_timestamps = [anchor_timestamps[idx] for idx in anchor_indices]
+
+        plan: Dict[str, Set[int]] = {anchor_topic: set(anchor_indices)}
+        for topic in self.config.image_topics:
+            if topic == anchor_topic:
+                continue
+            selected = self._select_nearest_unique_indices(
+                topic_timestamps.get(topic, []),
+                target_timestamps,
+            )
+            plan[topic] = set(selected)
+
+        return plan
+
+    def _select_nearest_unique_indices(
+        self, timestamps: List[int], target_timestamps: List[int]
+    ) -> List[int]:
+        """Greedily assign each target to the nearest unused timestamp."""
+        used: Set[int] = set()
+        selected: List[int] = []
+
+        for target in target_timestamps:
+            idx = self._find_nearest_unused_index(timestamps, target, used)
+            if idx is None:
+                break
+            used.add(idx)
+            selected.append(idx)
+
+        return selected
+
+    def _find_nearest_unused_index(
+        self, timestamps: List[int], target: int, used: Set[int]
+    ) -> Optional[int]:
+        """Find the nearest timestamp index that has not been assigned yet."""
+        if not timestamps or len(used) >= len(timestamps):
+            return None
+
+        idx = bisect.bisect_left(timestamps, target)
+        left = idx - 1
+        right = idx
+
+        while left >= 0 or right < len(timestamps):
+            candidates = []
+            if left >= 0 and left not in used:
+                candidates.append(left)
+            if right < len(timestamps) and right not in used:
+                candidates.append(right)
+            if candidates:
+                return min(candidates, key=lambda i: abs(timestamps[i] - target))
+            left -= 1
+            right += 1
+
+        return None
 
     def _handle_pointcloud(
         self, msg, topic: str, output_dir: Path,
@@ -860,6 +1126,7 @@ class McapImageExtractor:
 
         fieldnames = [
             'frame_id', 'filename', 'bag_file', 'topic', 'timestamp',
+            'timestamp_ns',
             'width', 'height',
             'gps_lat', 'gps_lon', 'gps_alt',
             'heading_deg', 'speed_mps',
@@ -875,7 +1142,8 @@ class McapImageExtractor:
                     'filename': entry['filename'],
                     'bag_file': entry['bag_file'],
                     'topic': entry['topic'],
-                    'timestamp': f"{entry['timestamp']:.9f}",
+                    'timestamp': format_timestamp_ns(entry['timestamp_ns']),
+                    'timestamp_ns': entry['timestamp_ns'],
                     'width': entry['width'],
                     'height': entry['height'],
                     'gps_lat': '',

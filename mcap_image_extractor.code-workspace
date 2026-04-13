@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../tractor_multi_cam_publisher"
+		}
+	],
+	"settings": {}
+}

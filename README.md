@@ -6,8 +6,10 @@ Extract image frames from ROS 2 MCAP bag files for **CVAT labeling** and data pr
 
 - **GUI application** — add multiple MCAP bags, browse and select topics, configure extraction
 - **Smart frame extraction** — configurable time interval (e.g. 1 frame / second) to avoid near-duplicate frames
+- **Random matched sampling** — export exactly `x` images per selected image topic using shared random timestamps matched as closely as possible
 - **Native resolution** — images are saved at original sensor resolution (e.g. ZED 2i)
 - **Format choice** — PNG (lossless) or high-quality JPEG with adjustable quality
+- **Traceable filenames** — image names include the exact topic and exact ROS timestamp
 - **GPS/GNSS synchronisation** — matches NovAtel BESTPOS or NavSatFix to each extracted frame
 - **Odometry sync** — extracts heading and speed from `nav_msgs/Odometry` topics
 - **Metadata CSV** — `filename, timestamp, gps_lat, gps_lon, gps_alt, heading, speed` per frame
@@ -58,7 +60,7 @@ python -m mcap_image_extractor.gui
 
 1. **Add Bags** — click "Add Bags" to select one or more `.mcap` files
 2. **Select Topics** — image topics are auto-selected; add GPS/Odom topics for metadata
-3. **Configure** — set frame interval, output format, and output directory
+3. **Configure** — choose interval sampling or random matched sampling, then set output format and output directory
 4. **Extract** — click "Extract" and monitor progress in the log
 
 ### Quick-Select Buttons
@@ -73,8 +75,8 @@ python -m mcap_image_extractor.gui
 output_dir/
 ├── images/
 │   ├── zed_zed_node_left_raw_image_raw_color_compressed/
-│   │   ├── 0000001.png
-│   │   ├── 0000002.png
+│   │   ├── %2Fzed%2Fzed_node%2Fleft_raw%2Fimage_raw_color%2Fcompressed__1713182400.123456789.png
+│   │   ├── %2Fzed%2Fzed_node%2Fleft_raw%2Fimage_raw_color%2Fcompressed__1713182401.456789123.png
 │   │   └── ...
 │   └── camera_rear_left_image_raw_compressed/
 │       └── ...
@@ -95,6 +97,7 @@ output_dir/
 | bag_file    | Source MCAP bag file name                      |
 | topic       | ROS topic the image was extracted from         |
 | timestamp   | Image timestamp (seconds, nanosecond precision)|
+| timestamp_ns| Exact image timestamp in nanoseconds           |
 | width       | Image width in pixels                          |
 | height      | Image height in pixels                         |
 | gps_lat     | Nearest GPS latitude (if available)            |
